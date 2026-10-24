@@ -1,0 +1,73 @@
+"""
+config.py - Single source of truth for every tunable in the system.
+
+WHY: Twelve-factor config. Every knob (queue fairness quantum, batching
+thresholds, LLM rate limits...) is an env var, so the same container image
+can run in dev (mock LLMs), staging (free-tier keys) and prod (paid keys)
+without code changes.
+"""
+from __future__ import annotations
+
+import logging
+from functools import lru_cache
+from typing import Literal
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    # --- Redis (Upstash) ---------------------------------------------------
+    # Use the TCP URL (rediss://default:<password>@<host>:6379), NOT the REST URL.
+    redis_url: str = "redis://localhost:6379/0"
+
+    # --- API ---------------------------------------------------------------
+    ingest_api_key: str = ""  # empty = auth disabled (POC convenience)
+    allow_admin_reset: bool = False  # enables POST /v1/admin/reset (demo only!)
+    max_backlog_per_tenant: int = 50_000  # backpressure: API returns 429 above this
+
+    # --- LLMs --------------------------------------------------------------
+    # "mock" runs the whole pipeline with keyword heuristics - zero API calls.
+    llm_mode: Literal["live", "mock"] = "live"
+    mock_latency_ms: int = 200  # simulated LLM latency so fairness is observable
+
+    groq_api_key: str = ""
+    groq_model: str = "llama-3.1-8b-instant"
+    groq_rpm: int = 30  # free-tier friendly; raise on paid plans
+
+    google_api_key: str = ""
+    # NOTE: Google has retired the Gemini 1.5 family. Any "*-flash" model works here.
+    gemini_model: str = "gemini-2.5-flash"
+    gemini_rpm: int = 10  # free-tier friendly
+
+    # --- Worker pool -------------------------------------------------------
+    num_workers: int = 5
+    fair_quantum: int = 2  # messages taken from EACH tenant per fetch
+    idle_max_sleep_s: float = 3.0  # idle backoff cap (protects Upstash command quota)
+    max_delivery_attempts: int = 3  # after this, message goes to the dead-letter stream
+    reclaim_idle_ms: int = 60_000  # a pending msg idle this long is considered orphaned
+    reclaim_interval_s: float = 30.0
+
+    # --- Smart batching ----------------------------------------------------
+    batch_threshold: int = 50  # > this many alerts per window => one AI summary
+    batch_window_s: float = 10.0  # flush cadence ("small time window")
+    slack_webhook_url: str = "mock"  # "mock" or "" => log + slack_outbox.jsonl
+    slack_min_interval_s: float = 1.1  # Slack allows ~1 msg/sec per webhook
+
+    log_level: str = "INFO"
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
+
+def setup_logging(level: str = "INFO") -> None:
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)-7s %(name)-18s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    # httpx logs every request at INFO - far too chatty for a worker loop.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
